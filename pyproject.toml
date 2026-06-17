@@ -46,6 +46,7 @@ version = { attr = "fpvgen.__version__" }
 generate_table = "scripts.generate_table:main"
 assemble_table = "scripts.assemble_table:main"
 plot_flamelets = "scripts.plot_flamelets:main"
+plot_flamelets_interactive = "scripts.plot_flamelets_interactive:main"
 
 [project.optional-dependencies]
 dev = [
