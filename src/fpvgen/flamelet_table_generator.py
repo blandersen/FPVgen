@@ -1,5 +1,6 @@
 import logging
 import datetime
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Union, Optional, Tuple, Literal
@@ -12,6 +13,142 @@ from scipy.special import erfcinv
 from scipy.signal import find_peaks
 
 from fpvgen import coordinate
+
+def _process_flamelet_worker(args):
+    """Process a single flamelet solution for FPV table assembly.
+
+    Runs in a subprocess; all Cantera objects are created locally so there is no
+    shared mutable state.  Returns a dict mapping variable name → interpolated
+    1-D array on Z_grid.
+    """
+    (flame_arrays, Z_i, Z_grid, mechanism_file, prog_def,
+     include_species_mass_fractions, include_species_production_rates,
+     include_energy_enthalpy_components) = args
+
+    gas = ct.Solution(mechanism_file)
+
+    def build_interp(Z, data):
+        return interpolate.interp1d(
+            Z, data, axis=0, bounds_error=False, fill_value=(data[0], data[-1])
+        )
+
+    T       = flame_arrays["T"]
+    Y       = flame_arrays["Y"]
+    P       = flame_arrays["P"]
+    density = flame_arrays["density"]
+    n_pts   = len(T)
+
+    E0_i  = flame_arrays["int_energy_mass"]
+    ROM_i = ct.gas_constant / flame_arrays["mean_molecular_weight"]
+
+    results = {}
+    results["ZBilger"]     = Z_grid
+    results["ROM"]         = build_interp(Z_i, ROM_i)(Z_grid)
+    results["T0"]          = build_interp(Z_i, T)(Z_grid)
+    results["rho0"]        = build_interp(Z_i, density)(Z_grid)
+    results["E0"]          = build_interp(Z_i, E0_i)(Z_grid)
+
+    # Per-point energy perturbation to compute thermodynamic derivatives
+    rho0deltaE = 5000.0
+    deltaE  = rho0deltaE / density
+    E0_p    = E0_i + deltaE
+    E0_m    = E0_i - deltaE
+    T0_p    = np.empty(n_pts)
+    T0_m    = np.empty(n_pts)
+    MU0_p   = np.empty(n_pts)
+    MU0_m   = np.empty(n_pts)
+    LOC0_p  = np.empty(n_pts)
+    LOC0_m  = np.empty(n_pts)
+    SRC_PROG_p = np.zeros(n_pts)
+    SRC_PROG_m = np.zeros(n_pts)
+
+    for j in range(n_pts):
+        gas.TPY = T[j], P, Y[:, j]
+        gas.UV  = E0_p[j], gas.v
+        T0_p[j]   = gas.T
+        MU0_p[j]  = gas.viscosity
+        LOC0_p[j] = gas.thermal_conductivity / gas.cp_mass
+        for species, value in prog_def.items():
+            idx = gas.species_index(species)
+            SRC_PROG_p[j] += value * gas.net_production_rates[idx] * gas.molecular_weights[idx]
+        SRC_PROG_p[j] /= gas.density
+
+        gas.TPY = T[j], P, Y[:, j]
+        gas.UV  = E0_m[j], gas.v
+        T0_m[j]   = gas.T
+        MU0_m[j]  = gas.viscosity
+        LOC0_m[j] = gas.thermal_conductivity / gas.cp_mass
+        for species, value in prog_def.items():
+            idx = gas.species_index(species)
+            SRC_PROG_m[j] += value * gas.net_production_rates[idx] * gas.molecular_weights[idx]
+        SRC_PROG_m[j] /= gas.density
+
+    dTm   = T - T0_m
+    dTp   = T0_p - T
+    dT    = T0_p - T0_m
+    dedT  = (  dTm**2           * (E0_i + deltaE)
+             + dT  * (dTp - dTm) * E0_i
+             - dTp**2           * (E0_i - deltaE)) / (dTp * dTm * dT)
+    d2edT2 = 2.0 * (  dTm * (E0_i + deltaE)
+                     - dT  *  E0_i
+                     + dTp * (E0_i - deltaE)) / (dTp * dTm * dT)
+
+    GAMMA0_i = ROM_i / dedT + 1.0
+    results["GAMMA0"] = build_interp(Z_i, GAMMA0_i)(Z_grid)
+    results["AGAMMA"] = build_interp(Z_i, -d2edT2 * (GAMMA0_i - 1.0)**2 / ROM_i)(Z_grid)
+
+    MU0_i  = flame_arrays["viscosity"]
+    LOC0_i = flame_arrays["thermal_conductivity"] / flame_arrays["cp_mass"]
+    results["MU0"]  = build_interp(Z_i, MU0_i)(Z_grid)
+    results["AMU"]  = build_interp(Z_i, np.log(MU0_p / MU0_m) / np.log(T0_p / T0_m))(Z_grid)
+    results["LOC0"] = build_interp(Z_i, LOC0_i)(Z_grid)
+    results["ALOC"] = build_interp(Z_i, np.log(LOC0_p / LOC0_m) / np.log(T0_p / T0_m))(Z_grid)
+
+    net_prod = flame_arrays["net_production_rates"]
+
+    # SRC_PROG and PROG use the full flame net_production_rates field (not perturbed gas)
+    prog_var_prod = np.zeros(n_pts)
+    prog_var      = np.zeros(n_pts)
+    for species, value in prog_def.items():
+        idx = gas.species_index(species)
+        prog_var_prod += value * net_prod[idx, :] * gas.molecular_weights[idx]
+        prog_var      += value * Y[idx, :]
+    results["SRC_PROG"]   = build_interp(Z_i, prog_var_prod / density)(Z_grid)
+    results["PROG"]       = build_interp(Z_i, prog_var)(Z_grid)
+    results["HeatRelease"] = build_interp(
+        Z_i, flame_arrays["heat_release_rate"] / density
+    )(Z_grid)
+
+    for sp in include_species_mass_fractions:
+        idx = gas.species_index(sp)
+        results[sp] = build_interp(Z_i, Y[idx, :])(Z_grid)
+
+    for sp in include_species_production_rates:
+        k = gas.species_index(sp)
+        results["SRC_" + sp] = build_interp(
+            Z_i, net_prod[k, :] * gas.molecular_weights[k] / density
+        )(Z_grid)
+
+    if include_energy_enthalpy_components:
+        E_CHEM_i = np.empty(n_pts)
+        for j in range(n_pts):
+            gas.TPY = 298.15, P, Y[:, j]
+            E_CHEM_i[j] = (
+                np.dot(gas.standard_enthalpies_RT, gas.X)
+                * ct.gas_constant * gas.T / gas.mean_molecular_weight
+            )
+        results["E_CHEM"]   = build_interp(Z_i, E_CHEM_i)(Z_grid)
+        results["E0_SENS"]  = build_interp(Z_i, E0_i - E_CHEM_i)(Z_grid)
+        results["H0"]       = build_interp(Z_i, flame_arrays["enthalpy_mass"])(Z_grid)
+        results["H0_SENS"]  = build_interp(Z_i, flame_arrays["enthalpy_mass"] - E_CHEM_i)(Z_grid)
+
+    TA_i = np.log(SRC_PROG_p / SRC_PROG_m) / ((1.0 / T0_p) - (1.0 / T0_m))
+    TA_i = np.maximum(TA_i, 0.0)
+    TA_i[np.isnan(TA_i)] = 0.0
+    results["TA"] = build_interp(Z_i, TA_i)(Z_grid)
+
+    return results
+
 
 pyplot_params = {
     "text.usetex": True,
@@ -1005,7 +1142,7 @@ class FlameletTableGenerator:
         self.logger.info(f"Completed {len(data)} points on the extinction branch")
         return data
 
-    def save_solution(self, output_dir: Path, solution_index: int) -> None:
+    def save_solution(self, output_dir: Path, solution_index: int, filename: str = "solutions.h5") -> None:
         """Save a single solution to the HDF5 files.
 
         Saves both the flame profiles and associated metadata for a single solution.
@@ -1013,8 +1150,9 @@ class FlameletTableGenerator:
         Args:
             output_dir: Directory path where files will be saved
             solution_index: Index of the solution being saved
+            filename: Name of the HDF5 file to write within output_dir
         """
-        solutions_file = output_dir / "solutions.h5"
+        solutions_file = output_dir / filename
         solution = self.solutions[solution_index]
         meta_name = f"meta_{solution_index:04d}"
         state_name = f"solution_state_{solution_index:04d}"
@@ -1076,17 +1214,37 @@ class FlameletTableGenerator:
         # Write flame profile
         solution["state"].save(solutions_file, name=state_name, overwrite=True)
 
-    def save_all_solutions(self, output_dir: Path) -> None:
+    def save_all_solutions(self, output_dir: Path, filename: str = "solutions.h5") -> None:
         """Save all computed solutions to HDF5 files.
 
         Args:
             output_dir: Directory path where files will be saved
+            filename: Name of the HDF5 file to write within output_dir
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for i in range(len(self.solutions)):
-            self.save_solution(output_dir, i)
+            self.save_solution(output_dir, i, filename=filename)
+
+    def _save_solution_subset(self, output_dir: Path, indices: List[int], filename: str) -> None:
+        """Save a contiguously-renumbered subset of solutions to an HDF5 file.
+
+        The kept solutions are written under indices 0..len(indices)-1 so the resulting
+        file is a valid solutions file that ``load_solutions`` can read back unchanged.
+        ``self.solutions`` is not mutated.
+
+        Args:
+            output_dir: Directory path where the file will be saved
+            indices: Sorted list of solution indices to keep
+            filename: Name of the HDF5 file to write within output_dir
+        """
+        original_solutions = self.solutions
+        try:
+            self.solutions = [original_solutions[i] for i in indices]
+            self.save_all_solutions(output_dir, filename=filename)
+        finally:
+            self.solutions = original_solutions
 
     @classmethod
     def load_solutions(
@@ -1295,6 +1453,7 @@ class FlameletTableGenerator:
         include_species_mass_fractions: Union[str, List[str]] = [],
         include_species_production_rates: Union[str, List[str]] = [],
         include_energy_enthalpy_components: bool = False,
+        n_workers: Optional[int] = None,
     ) -> None:
         """Assemble a Flamelet Progress Variable (FPV) table and write it in CharlesX format.
 
@@ -1354,179 +1513,46 @@ class FlameletTableGenerator:
         vars += ["TA"]
         data_interp_Z = {var: np.zeros((dims[0], N_sol)) for var in vars}
 
-        def build_interp(Z, data):
-            return interpolate.interp1d(Z, data, axis=0, bounds_error=False, fill_value=(data[0], data[-1]))
-
-        # Compute the data arrays
-        for i, sol in enumerate(self.solutions):
-            self.logger.info(f"Processing flamelet {i+1}/{N_sol}...")
+        # Extract all needed numpy arrays from each flamelet state up-front (serial,
+        # cheap) so that subprocess workers receive only plain numpy dicts and a
+        # mechanism file path — no Cantera objects cross the process boundary.
+        self.logger.info("Extracting flamelet state arrays...")
+        flamelet_arrays = []
+        for sol in self.solutions:
             self.flame.from_array(sol["state"])
+            flamelet_arrays.append({
+                "T":                   self.flame.T.copy(),
+                "Y":                   self.flame.Y.copy(),
+                "P":                   float(self.flame.P),
+                "density":             self.flame.density.copy(),
+                "viscosity":           self.flame.viscosity.copy(),
+                "thermal_conductivity": self.flame.thermal_conductivity.copy(),
+                "cp_mass":             self.flame.cp_mass.copy(),
+                "int_energy_mass":     self.flame.int_energy_mass.copy(),
+                "heat_release_rate":   self.flame.heat_release_rate.copy(),
+                "net_production_rates": self.flame.net_production_rates.copy(),
+                "enthalpy_mass":       self.flame.enthalpy_mass.copy(),
+                "mean_molecular_weight": self.flame.mean_molecular_weight.copy(),
+            })
 
-            # ZBilger [-]
-            Z_i = self.flame.mixture_fraction("Bilger")
-            data_interp_Z["ZBilger"][:, i] = Z.grid
+        worker_args = [
+            (flamelet_arrays[i], self.solutions[i]["Z"], Z.grid,
+             self.mechanism_file, self.prog_def,
+             list(include_species_mass_fractions),
+             list(include_species_production_rates),
+             include_energy_enthalpy_components)
+            for i in range(N_sol)
+        ]
 
-            # ROM [J/kg/K]
-            ROM_i = ct.gas_constant / self.flame.mean_molecular_weight
-            interp = build_interp(Z_i, ROM_i)
-            data_interp_Z["ROM"][:, i] = interp(Z.grid)
+        self.logger.info(
+            f"Processing {N_sol} flamelets in parallel (n_workers={n_workers})..."
+        )
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            results = list(executor.map(_process_flamelet_worker, worker_args))
 
-            # T0 [K]
-            T0_i = self.flame.T
-            interp = build_interp(Z_i, T0_i)
-            data_interp_Z["T0"][:, i] = interp(Z.grid)
-
-            # rho0 [kg/m^3]
-            rho0_i = self.flame.density
-            interp = build_interp(Z_i, rho0_i)
-            data_interp_Z["rho0"][:, i] = interp(Z.grid)
-
-            # E0 [J/kg]
-            E0_i = self.flame.int_energy_mass
-            interp = build_interp(Z_i, E0_i)
-            data_interp_Z["E0"][:, i] = interp(Z.grid)
-
-
-
-            # Compute derivatives via energy perturbation
-            rho0deltaE = 5000.0
-            deltaE = rho0deltaE / self.flame.density
-            E0_p = E0_i + deltaE
-            E0_m = E0_i - deltaE
-            T0_p = np.zeros_like(T0_i)
-            T0_m = np.zeros_like(T0_i)
-            MU0_p = np.zeros_like(T0_i)
-            MU0_m = np.zeros_like(T0_i)
-            LOC0_p = np.zeros_like(T0_i)
-            LOC0_m = np.zeros_like(T0_i)
-            SRC_PROG_p = np.zeros_like(T0_i)
-            SRC_PROG_m = np.zeros_like(T0_i)
-            for j in range(len(self.flame.grid)):
-                # Positive perturbation
-                self.gas.TPY = self.flame.T[j], self.flame.P, self.flame.Y[:, j]
-                self.gas.UV = E0_p[j], self.gas.v
-                T0_p[j] = self.gas.T
-                MU0_p[j] = self.gas.viscosity
-                LOC0_p[j] = self.gas.thermal_conductivity / self.gas.cp_mass
-                for species, value in self.prog_def.items():
-                    idx = self.gas.species_index(species)
-                    SRC_PROG_p[j] += value * self.gas.net_production_rates[idx] * self.gas.molecular_weights[idx]
-                SRC_PROG_p[j] /= self.gas.density
-
-                # Negative perturbation
-                self.gas.TPY = self.flame.T[j], self.flame.P, self.flame.Y[:, j]
-                self.gas.UV = E0_m[j], self.gas.v
-                T0_m[j] = self.gas.T
-                MU0_m[j] = self.gas.viscosity
-                LOC0_m[j] = self.gas.thermal_conductivity / self.gas.cp_mass
-                for species, value in self.prog_def.items():
-                    idx = self.gas.species_index(species)
-                    SRC_PROG_m[j] += value * self.gas.net_production_rates[idx] * self.gas.molecular_weights[idx]
-                SRC_PROG_m[j] /= self.gas.density
-            # Energy derivatives
-            dTm = T0_i - T0_m
-            dTp = T0_p - T0_i
-            dT = T0_p - T0_m
-            dedT = (  dTm**2 *           (E0_i + deltaE)
-                    + dT * (dTp - dTm) *  E0_i
-                    - dTp**2 *           (E0_i - deltaE)) / (dTp * dTm * dT)
-            d2edT2 = 2.0 * (  dTm * (E0_i + deltaE)
-                            - dT *   E0_i
-                            + dTp * (E0_i - deltaE)) / (dTp * dTm * dT)
-
-            # GAMMA0 (specific gas constant) [-]
-            GAMMA0_i = ROM_i / dedT + 1.0
-            interp = build_interp(Z_i, GAMMA0_i)
-            data_interp_Z["GAMMA0"][:, i] = interp(Z.grid)
-
-            # AGAMMA (exponent of specific gas constant) [-]
-            AGAMMA_i = -d2edT2 * (GAMMA0_i - 1.0) ** 2 / ROM_i
-            interp = build_interp(Z_i, AGAMMA_i)
-            data_interp_Z["AGAMMA"][:, i] = interp(Z.grid)
-
-            # MU0 (viscosity) [kg/m/s]
-            MU0_i = self.flame.viscosity
-            interp = build_interp(Z_i, MU0_i)
-            data_interp_Z["MU0"][:, i] = interp(Z.grid)
-
-            # AMU (exponent of viscosity) [-]
-            AMU_i = np.log(MU0_p / MU0_m) / np.log(T0_p / T0_m)
-            interp = build_interp(Z_i, AMU_i)
-            data_interp_Z["AMU"][:, i] = interp(Z.grid)
-
-            # LOC0 (lambda / cp) [kg/m/s]
-            LOC0_i = self.flame.thermal_conductivity / self.flame.cp_mass
-            interp = build_interp(Z_i, LOC0_i)
-            data_interp_Z["LOC0"][:, i] = interp(Z.grid)
-
-            # ALOC (exponent of lambda / cp) [-]
-            ALOC_i = np.log(LOC0_p / LOC0_m) / np.log(T0_p / T0_m)
-            interp = build_interp(Z_i, ALOC_i)
-            data_interp_Z["ALOC"][:, i] = interp(Z.grid)
-
-            # SRC_PROG [1/s]
-            SRC_PROG_i = self._compute_progress_variable_production() / self.flame.density
-            interp = build_interp(Z_i, SRC_PROG_i)
-            data_interp_Z["SRC_PROG"][:, i] = interp(Z.grid)
-
-            # PROG [-]
-            C_i = self._compute_progress_variable()
-            interp = build_interp(Z_i, C_i)
-            data_interp_Z["PROG"][:, i] = interp(Z.grid)
-
-            # HeatRelease [W/kg]
-            HeatRelease_i = self.flame.heat_release_rate / self.flame.density
-            interp = build_interp(Z_i, HeatRelease_i)
-            data_interp_Z["HeatRelease"][:, i] = interp(Z.grid)
-
-            # Species mass fractions [-]
-            for sp in include_species_mass_fractions:
-                Y_i = self.flame.Y[self.gas.species_index(sp), :]
-                interp = build_interp(Z_i, Y_i)
-                data_interp_Z[sp][:, i] = interp(Z.grid)
-
-            # Species production rates [1/s]
-            for sp in include_species_production_rates:
-                k = self.gas.species_index(sp)
-                SRC_i = self.flame.net_production_rates[k, :] * self.gas.molecular_weights[k] / self.flame.density
-                interp = build_interp(Z_i, SRC_i)
-                data_interp_Z["SRC_" + sp][:, i] = interp(Z.grid)
-            
-            if include_energy_enthalpy_components:
-                # E_CHEM [J/kg]
-                E_CHEM_i = np.zeros_like(self.flame.grid)
-                for j in range(len(self.flame.grid)):
-                    self.gas.TPY = 298.15, self.flame.P, self.flame.Y[:, j]
-                    E_CHEM_i[j] = (
-                        np.dot(self.gas.standard_enthalpies_RT, self.gas.X)
-                        * ct.gas_constant
-                        * self.gas.T
-                        / self.gas.mean_molecular_weight
-                    )
-                interp = build_interp(Z_i, E_CHEM_i)
-                data_interp_Z["E_CHEM"][:, i] = interp(Z.grid)
-
-                # E0_SENS [J/kg]
-                E0_SENS_i = E0_i - E_CHEM_i
-                interp = build_interp(Z_i, E0_SENS_i)
-                data_interp_Z["E0_SENS"][:, i] = interp(Z.grid)
-
-                # H0 [J/kg]
-                H0_i = self.flame.enthalpy_mass
-                interp = build_interp(Z_i, H0_i)
-                data_interp_Z["H0"][:, i] = interp(Z.grid)
-
-                # H0_SENS [J/kg]
-                H0_SENS_i = H0_i - E_CHEM_i
-                interp = build_interp(Z_i, H0_SENS_i)
-                data_interp_Z["H0_SENS"][:, i] = interp(Z.grid)
-            
-            # Activation temperature [K]
-            TA_i = np.log(SRC_PROG_p / SRC_PROG_m) / ((1.0 / T0_p) - (1.0 / T0_m))
-            TA_i = np.maximum(TA_i, 0.0)
-            TA_i[np.isnan(TA_i)] = 0.0
-            interp = build_interp(Z_i, TA_i)
-            data_interp_Z["TA"][:, i] = interp(Z.grid)
+        for i, res in enumerate(results):
+            for var in vars:
+                data_interp_Z[var][:, i] = res[var]
 
         # Sort flamelets by peak progress variable
         C_peak = np.max(data_interp_Z["PROG"], axis=0)
@@ -1930,6 +1956,417 @@ class FlameletTableGenerator:
             fig.savefig(output_file, bbox_inches="tight", dpi=300)
 
         return fig, ax
+
+    def plot_flamelets_interactive(
+        self,
+        output_dir: Optional[Path] = None,
+        save_filtered: bool = True,
+        filtered_filename: str = "solutions_filtered.h5",
+    ) -> Dict[str, List[int]]:
+        """Interactively inspect flamelet solutions and select ones to omit.
+
+        Opens a matplotlib GUI that plots every flamelet solution and lets the user pick
+        the x/y variables. Two view modes are available:
+
+        - **Scatter**: one point per flamelet, with axes drawn from per-flamelet scalar
+          quantities (the ``metadata`` keys, e.g. ``chi_st`` vs ``T_max``). Best for
+          spotting outliers on the S-curve.
+        - **Profiles**: one curve per flamelet over its grid, with axes drawn from profile
+          variables (``Z``, ``T``, ``C``, ``chi``, and selected species mass fractions).
+
+        Click a point (scatter) or curve (profiles) to toggle whether that flamelet is
+        omitted. Omitted flamelets are greyed out. When "Save & Close" is pressed and at
+        least one flamelet is omitted, the kept flamelets are written to a filtered HDF5
+        solutions file (contiguously renumbered) that ``load_solutions`` can read back.
+
+        Args:
+            output_dir: Directory to write the filtered solutions file (defaults to the
+                current working directory).
+            save_filtered: Whether to write the filtered file on save.
+            filtered_filename: Name of the filtered solutions file to write.
+
+        Returns:
+            Dict with keys ``"kept"`` and ``"omitted"`` listing the original solution
+            indices that were kept / omitted.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.widgets import RadioButtons, Button, TextBox
+        from matplotlib.collections import LineCollection
+        from matplotlib.lines import Line2D
+
+        n_sol = len(self.solutions)
+        if n_sol == 0:
+            raise ValueError("No solutions to plot.")
+
+        # Disable LaTeX rendering for this interactive session: variable names contain
+        # underscores and button labels contain "&", both of which break the LaTeX
+        # backend. Restored after the (blocking) window closes.
+        prev_usetex = plt.rcParams["text.usetex"]
+        plt.rcParams["text.usetex"] = False
+
+        # --- Variable registries -------------------------------------------------------
+        # Scalar variables (scatter view): one value per flamelet. Only metadata keys that
+        # are present in *every* solution are offered, so querying never hits a KeyError
+        # (different branches store slightly different metadata, e.g. the extinct branch
+        # omits "Tc_increment"/"errors").
+        common_meta = set.intersection(*[set(sol["metadata"].keys()) for sol in self.solutions])
+        scalar_keys = ["index"] + [
+            k for k, v in self.solutions[0]["metadata"].items()
+            if k in common_meta and isinstance(v, (int, float, np.number))
+        ]
+
+        def scalar_values(key: str) -> np.ndarray:
+            if key == "index":
+                return np.arange(n_sol, dtype=float)
+            return np.array([float(sol["metadata"].get(key, np.nan)) for sol in self.solutions])
+
+        # Profile variables (profiles view): an array per flamelet over the grid. Available
+        # names are the mixture fraction (Z), temperature (T), progress variable (C), the
+        # progress-variable source term (SRC_C), and any species mass fraction.
+        #
+        # Values are read directly from each solution's stored ``SolutionArray`` (T and Y
+        # are already in memory) rather than restoring every flamelet into the 1D flame
+        # domain via ``from_array`` -- the latter is ~20x slower and dominated the load
+        # time. Note ``SolutionArray.Y`` is shaped (n_points, n_species).
+        species_names = list(self.gas.species_names)
+        profile_keys = ["Z", "T", "C", "SRC_C"] + species_names
+        prog_idx = np.array([self.gas.species_index(s) for s in self.prog_def])
+        prog_coef = np.array([self.prog_def[s] for s in self.prog_def])
+        mol_weights = self.gas.molecular_weights
+
+        base_cache: Dict[int, Dict[str, np.ndarray]] = {}
+        srcC_cache: Dict[int, np.ndarray] = {}
+
+        def profile_base(i: int) -> Dict[str, np.ndarray]:
+            if i not in base_cache:
+                sol = self.solutions[i]
+                st = sol["state"]
+                base_cache[i] = {
+                    "Z": np.asarray(sol["Z"]),
+                    "T": np.asarray(st.T),
+                    "Y": np.asarray(st.Y),  # (n_points, n_species)
+                }
+            return base_cache[i]
+
+        def profile_value(i: int, key: str) -> np.ndarray:
+            b = profile_base(i)
+            if key in ("Z", "T"):
+                return b[key]
+            if key == "C":
+                return b["Y"][:, prog_idx] @ prog_coef
+            if key == "SRC_C":
+                if i not in srcC_cache:
+                    # Net production rate is a kinetic quantity, so it is computed on
+                    # demand (only when SRC_C is actually requested) and cached.
+                    wdot = np.asarray(self.solutions[i]["state"].net_production_rates)
+                    srcC_cache[i] = (wdot[:, prog_idx] * mol_weights[prog_idx]) @ prog_coef
+                return srcC_cache[i]
+            return b["Y"][:, self.gas.species_index(key)]
+
+        # Per-flamelet branch colors (used to color profile curves so outliers / bad
+        # branches stand out).
+        branch_ids = [int(self.solutions[i]["metadata"].get("branch_id", 0)) for i in range(n_sol)]
+        unique_branches = sorted(set(branch_ids))
+        _cmap = plt.get_cmap("tab10")
+        branch_color = {b: _cmap(k % 10) for k, b in enumerate(unique_branches)}
+
+        def parse_index_list(text: str) -> set:
+            """Parse a comma-separated list of indices/ranges, e.g. '1, 5, 10-20'."""
+            out: set = set()
+            for tok in text.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if "-" in tok.lstrip("-"):  # a range like 10-20 (not a bare negative)
+                    a, b = tok.split("-", 1)
+                    lo, hi = int(a), int(b)
+                    out.update(range(min(lo, hi), max(lo, hi) + 1))
+                else:
+                    out.add(int(tok))
+            return {i for i in out if 0 <= i < n_sol}
+
+        # Variables that read best on a log axis.
+        log_vars = {"chi_st", "strain_rate_max", "strain_rate_nom",
+                    "total_heat_release_rate"}
+
+        # --- State ---------------------------------------------------------------------
+        omitted: set = set()
+        # X/Y selections are remembered separately per view mode.
+        scatter_x = "chi_st" if "chi_st" in scalar_keys else (scalar_keys[1] if len(scalar_keys) > 1 else scalar_keys[0])
+        scatter_y = "T_max" if "T_max" in scalar_keys else scalar_keys[-1]
+        state = {
+            "mode": "Scatter",
+            "Scatter": {"x": scatter_x, "y": scatter_y},
+            "Profiles": {"x": "Z", "y": "C"},
+        }
+        artist_to_index: Dict[object, int] = {}
+
+        def cur() -> Dict[str, str]:
+            return state[state["mode"]]
+
+        # --- Figure layout -------------------------------------------------------------
+        fig = plt.figure(figsize=(13, 7))
+        fig.subplots_adjust(left=0.30, right=0.97, top=0.95, bottom=0.10)
+        ax = fig.add_subplot(111)
+
+        ax_mode = fig.add_axes([0.02, 0.78, 0.22, 0.15])
+        ax_xradio = fig.add_axes([0.02, 0.44, 0.10, 0.30])
+        ax_yradio = fig.add_axes([0.14, 0.44, 0.10, 0.30])
+        ax_omit = fig.add_axes([0.075, 0.30, 0.165, 0.05])
+        ax_invert = fig.add_axes([0.02, 0.22, 0.10, 0.05])
+        ax_reset = fig.add_axes([0.14, 0.22, 0.10, 0.05])
+        ax_save = fig.add_axes([0.02, 0.14, 0.22, 0.05])
+        for a in (ax_xradio, ax_yradio):
+            a.set_title("")
+
+        mode_radio = RadioButtons(ax_mode, ("Scatter", "Profiles"), active=0)
+        ax_mode.set_title("View mode", fontsize=9)
+        omit_box = TextBox(ax_omit, "Omit ", initial="")
+        ax_omit.set_title("Omit indices (e.g. 1, 5, 10-20)", fontsize=7, loc="left")
+        invert_btn = Button(ax_invert, "Invert")
+        reset_btn = Button(ax_reset, "Reset")
+        save_btn = Button(ax_save, "Save & Close")
+
+        info = fig.text(0.30, 0.965, "", fontsize=9, va="bottom")
+
+        # Holders for the X/Y selector widgets (rebuilt when the mode changes). In Scatter
+        # mode these are RadioButtons over the (small) scalar key list; in Profiles mode,
+        # where there are 50+ possible variables, they are typed TextBoxes validated
+        # against ``profile_keys``.
+        widgets = {"x": None, "y": None}
+
+        def build_var_radios():
+            # Fully disconnect the previous widgets before clearing their axes; otherwise
+            # their blitting draw_event callbacks keep firing on stale artists and crash.
+            for key in ("x", "y"):
+                if widgets[key] is not None:
+                    widgets[key].disconnect_events()
+            ax_xradio.clear()
+            ax_yradio.clear()
+            sel = cur()
+
+            if state["mode"] == "Scatter":
+                # Tall side-by-side radio columns.
+                ax_xradio.set_position([0.02, 0.44, 0.10, 0.30])
+                ax_yradio.set_position([0.14, 0.44, 0.10, 0.30])
+                keys = scalar_keys
+                if sel["x"] not in keys:
+                    sel["x"] = keys[0]
+                if sel["y"] not in keys:
+                    sel["y"] = keys[min(1, len(keys) - 1)]
+                ax_xradio.set_title("X", fontsize=9)
+                ax_yradio.set_title("Y", fontsize=9)
+                widgets["x"] = RadioButtons(ax_xradio, keys, active=keys.index(sel["x"]))
+                widgets["y"] = RadioButtons(ax_yradio, keys, active=keys.index(sel["y"]))
+                for labels in (widgets["x"].labels, widgets["y"].labels):
+                    for lbl in labels:
+                        lbl.set_fontsize(8)
+                widgets["x"].on_clicked(on_x)
+                widgets["y"].on_clicked(on_y)
+            else:
+                # Short, stacked text-entry boxes; typing a name and pressing Enter
+                # updates the axis (valid: Z, T, C, SRC_C, or any species name).
+                ax_xradio.set_position([0.04, 0.66, 0.20, 0.045])
+                ax_yradio.set_position([0.04, 0.56, 0.20, 0.045])
+                ax_xradio.set_title("X  (Z, T, C, SRC_C, <species>)", fontsize=7, loc="left")
+                ax_yradio.set_title("Y", fontsize=7, loc="left")
+                widgets["x"] = TextBox(ax_xradio, "", initial=sel["x"])
+                widgets["y"] = TextBox(ax_yradio, "", initial=sel["y"])
+                widgets["x"].on_submit(lambda text: on_text("x", text))
+                widgets["y"].on_submit(lambda text: on_text("y", text))
+
+        def redraw():
+            ax.clear()
+            artist_to_index.clear()
+            sel = cur()
+            xkey, ykey = sel["x"], sel["y"]
+
+            if state["mode"] == "Scatter":
+                xv = scalar_values(xkey)
+                yv = scalar_values(ykey)
+                kept_mask = np.array([i not in omitted for i in range(n_sol)])
+                if kept_mask.any():
+                    sc = ax.scatter(xv[kept_mask], yv[kept_mask],
+                                    c="tab:blue", picker=True, zorder=3, s=40)
+                    artist_to_index[sc] = np.nonzero(kept_mask)[0]
+                if (~kept_mask).any():
+                    sc_om = ax.scatter(xv[~kept_mask], yv[~kept_mask],
+                                       facecolors="none", edgecolors="0.6",
+                                       picker=True, zorder=2, s=40)
+                    artist_to_index[sc_om] = np.nonzero(~kept_mask)[0]
+            else:
+                # All curves are drawn as one (kept) / two (kept + omitted) LineCollections
+                # rather than thousands of Line2D artists, which keeps both the initial
+                # draw and click-picking fast.
+                kept_segs, kept_idx, kept_colors = [], [], []
+                om_segs, om_idx = [], []
+                for i in range(n_sol):
+                    seg = np.column_stack([profile_value(i, xkey), profile_value(i, ykey)])
+                    if i in omitted:
+                        om_segs.append(seg)
+                        om_idx.append(i)
+                    else:
+                        kept_segs.append(seg)
+                        kept_idx.append(i)
+                        kept_colors.append(branch_color[branch_ids[i]])
+                if om_segs:
+                    lc_om = LineCollection(om_segs, colors="0.8", linewidths=0.6,
+                                           alpha=0.5, zorder=1, picker=True)
+                    lc_om.set_pickradius(4)
+                    ax.add_collection(lc_om, autolim=True)
+                    artist_to_index[lc_om] = np.array(om_idx)
+                if kept_segs:
+                    lc = LineCollection(kept_segs, colors=kept_colors, linewidths=0.8,
+                                        alpha=0.8, zorder=2, picker=True)
+                    lc.set_pickradius(4)
+                    ax.add_collection(lc, autolim=True)
+                    artist_to_index[lc] = np.array(kept_idx)
+                ax.autoscale_view()
+                if len(unique_branches) > 1:
+                    ax.legend(handles=[Line2D([0], [0], color=branch_color[b], lw=1.5,
+                                              label=f"branch {b}") for b in unique_branches],
+                              fontsize=8, loc="best")
+
+            ax.set_xlabel(xkey)
+            ax.set_ylabel(ykey)
+            ax.set_xscale("log" if xkey in log_vars else "linear")
+            ax.set_yscale("log" if ykey in log_vars else "linear")
+            ax.grid(True, which="both", alpha=0.2)
+            ax.set_title(f"{len(omitted)} omitted / {n_sol} flamelets "
+                         f"(click a curve/point to toggle, or use the Omit box)", fontsize=10)
+            fig.canvas.draw_idle()
+
+        # Keep the "Omit indices" text box in sync with the omitted set without
+        # re-triggering its own submit callback.
+        omit_suppress = {"v": False}
+
+        def refresh_omit_box():
+            omit_suppress["v"] = True
+            omit_box.set_val(", ".join(str(i) for i in sorted(omitted)))
+            omit_suppress["v"] = False
+
+        def toggle(i: int):
+            if i in omitted:
+                omitted.discard(i)
+            else:
+                omitted.add(i)
+            meta = self.solutions[i]["metadata"]
+            info.set_text(
+                f"Flamelet {i}: chi_st={meta.get('chi_st', float('nan')):.3e}, "
+                f"T_max={meta.get('T_max', float('nan')):.1f} K, "
+                f"branch={meta.get('branch_id', '?')}  "
+                f"[{'OMITTED' if i in omitted else 'kept'}]"
+            )
+            refresh_omit_box()
+            redraw()
+
+        def on_pick(event):
+            idx = artist_to_index.get(event.artist)
+            if idx is None:
+                return
+            if np.ndim(idx) == 0:  # a single Line2D -> one flamelet index
+                toggle(int(idx))
+            else:  # a scatter collection -> map picked offset to flamelet index
+                if len(event.ind) == 0:
+                    return
+                toggle(int(idx[event.ind[0]]))
+
+        def on_x(label):
+            cur()["x"] = label
+            redraw()
+
+        def on_y(label):
+            cur()["y"] = label
+            redraw()
+
+        reverting = {"x": False, "y": False}
+
+        def on_text(axis, text):
+            if reverting[axis]:
+                return
+            key = text.strip()
+            valid = key in profile_keys or key in self.gas.species_names
+            if not valid:
+                info.set_text(f"Unknown profile variable '{key}'. "
+                              f"Use Z, T, C, SRC_C, or a species name.")
+                # Revert the box to the last valid selection (guarded re-entry).
+                reverting[axis] = True
+                widgets[axis].set_val(cur()[axis])
+                reverting[axis] = False
+                fig.canvas.draw_idle()
+                return
+            info.set_text("")
+            cur()[axis] = key
+            redraw()
+
+        def on_mode(label):
+            state["mode"] = label
+            build_var_radios()
+            redraw()
+
+        def on_omit_submit(text):
+            if omit_suppress["v"]:
+                return
+            try:
+                new = parse_index_list(text)
+            except ValueError:
+                info.set_text("Could not parse omit list. Use e.g. '1, 5, 10-20'.")
+                refresh_omit_box()
+                fig.canvas.draw_idle()
+                return
+            omitted.clear()
+            omitted.update(new)
+            info.set_text(f"Omit list set: {len(omitted)} flamelet(s).")
+            refresh_omit_box()
+            redraw()
+
+        def on_invert(_event):
+            omitted.symmetric_difference_update(range(n_sol))
+            refresh_omit_box()
+            redraw()
+
+        def on_reset(_event):
+            omitted.clear()
+            info.set_text("")
+            refresh_omit_box()
+            redraw()
+
+        result: Dict[str, List[int]] = {
+            "kept": list(range(n_sol)),
+            "omitted": [],
+        }
+
+        def on_save(_event):
+            kept = [i for i in range(n_sol) if i not in omitted]
+            result["kept"] = kept
+            result["omitted"] = sorted(omitted)
+            if save_filtered and omitted:
+                out = Path(output_dir) if output_dir is not None else Path.cwd()
+                out.mkdir(parents=True, exist_ok=True)
+                self._save_solution_subset(out, kept, filtered_filename)
+                self.logger.info(
+                    f"Wrote {len(kept)} kept flamelets to {out / filtered_filename} "
+                    f"(omitted {len(omitted)}: {sorted(omitted)})"
+                )
+            elif save_filtered:
+                self.logger.info("No flamelets omitted; filtered file not written.")
+            plt.close(fig)
+
+        mode_radio.on_clicked(on_mode)
+        omit_box.on_submit(on_omit_submit)
+        invert_btn.on_clicked(on_invert)
+        reset_btn.on_clicked(on_reset)
+        save_btn.on_clicked(on_save)
+        fig.canvas.mpl_connect("pick_event", on_pick)
+
+        build_var_radios()
+        redraw()
+        try:
+            plt.show()
+        finally:
+            plt.rcParams["text.usetex"] = prev_usetex
+
+        return result
 
     def plot_table(
         self,
